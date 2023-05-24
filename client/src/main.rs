@@ -75,14 +75,6 @@ pub fn enable_mtud_if_supported() -> quinn::TransportConfig {
     transport_config
 }
 
-/// Enables MTUD if supported by the operating system
-#[cfg(any(windows, os = "linux"))]
-pub fn enable_mtud_if_supported() -> quinn::TransportConfig {
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
-    transport_config
-}
-
 struct SkipServerVerification;
 
 impl SkipServerVerification {
