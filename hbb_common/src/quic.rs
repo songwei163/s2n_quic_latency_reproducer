@@ -10,9 +10,7 @@ use futures_util::{
 use protobuf::Message;
 use rustls;
 use s2n_quic::{
-    client::Connect,
-    provider::{io::tokio::Builder as IoBuilder},
-    stream::BidirectionalStream,
+    client::Connect, provider::io::tokio::Builder as IoBuilder, stream::BidirectionalStream,
     Client, Server,
 };
 use std::{
@@ -164,26 +162,38 @@ pub struct Limits {
 }
 
 impl Limits {
-
     pub fn new() -> Self {
         // 50 Mbits/s and RTT 200 ms
-        Limits { max_throughput: 50, expected_rtt: 200 }
+        Limits {
+            max_throughput: 50,
+            expected_rtt: 200,
+        }
     }
 
     pub fn limits(&self) -> s2n_quic::provider::limits::Limits {
         let data_window = self.data_window();
 
         s2n_quic::provider::limits::Limits::default()
-            .with_data_window(data_window).unwrap()
-            .with_max_handshake_duration(core::time::Duration::from_millis(self.expected_rtt)).unwrap()
-            .with_max_send_buffer_size(data_window.min(u32::MAX as _) as _).unwrap()
-            .with_bidirectional_local_data_window(data_window).unwrap()
-            .with_bidirectional_remote_data_window(data_window).unwrap()
-            .with_unidirectional_data_window(data_window).unwrap()
-            .with_max_open_local_bidirectional_streams(data_window).unwrap()
-            .with_max_open_remote_bidirectional_streams(data_window).unwrap()
-            .with_max_ack_delay(core::time::Duration::from_millis(self.expected_rtt)).unwrap()
-            .with_max_keep_alive_period(core::time::Duration::from_millis(self.expected_rtt)).unwrap()
+            .with_data_window(data_window)
+            .unwrap()
+            .with_max_handshake_duration(core::time::Duration::from_millis(self.expected_rtt))
+            .unwrap()
+            .with_max_send_buffer_size(data_window.min(u32::MAX as _) as _)
+            .unwrap()
+            .with_bidirectional_local_data_window(data_window)
+            .unwrap()
+            .with_bidirectional_remote_data_window(data_window)
+            .unwrap()
+            .with_unidirectional_data_window(data_window)
+            .unwrap()
+            .with_max_open_local_bidirectional_streams(data_window)
+            .unwrap()
+            .with_max_open_remote_bidirectional_streams(data_window)
+            .unwrap()
+            .with_max_ack_delay(core::time::Duration::from_millis(self.expected_rtt))
+            .unwrap()
+            .with_max_keep_alive_period(core::time::Duration::from_millis(self.expected_rtt))
+            .unwrap()
     }
 
     const fn compute_data_window(&self, mbps: u64, rtt: Duration, rtt_count: u64) -> u64 {
@@ -195,7 +205,7 @@ impl Limits {
         window *= rtt.as_millis() as u64;
         // bytes/RTT * rtt_count -> N * bytes/RTT
         window *= rtt_count;
-    
+
         window as u64
     }
 

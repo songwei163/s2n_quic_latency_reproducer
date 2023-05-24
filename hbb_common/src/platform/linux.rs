@@ -85,8 +85,9 @@ pub fn get_value_of_seat0(i: usize) -> String {
     }
 
     // loginctl has not given the expected output.  try something else.
-    if let Ok(sid) = std::env::var("XDG_SESSION_ID") { // could also execute "cat /proc/self/sessionid"
-         return sid.to_owned();
+    if let Ok(sid) = std::env::var("XDG_SESSION_ID") {
+        // could also execute "cat /proc/self/sessionid"
+        return sid.to_owned();
     }
 
     return "".to_owned();

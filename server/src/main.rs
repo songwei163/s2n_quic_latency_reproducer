@@ -109,16 +109,16 @@ async fn handle_request(
                                     }
                                 }
                                 Err(e) => {
-                                    error!("parse failed: {:?}", e);
+                                    return Err(anyhow!("parse failed {:?}", e));
                                 }
                             }
                         }
                         Err(e) => {
-                            error!("recv err: {:?}", e);
+                            return Err(anyhow!("{:?}", e)); 
                         }
                     }
                 } else {
-                    error!("recv null");
+                    return Err(anyhow!("recv null"));
                 }
             }
         }
@@ -136,7 +136,7 @@ async fn main() -> ResultType<()> {
             Some(incoming_conn) = endpoint.accept() => {
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(incoming_conn).await {
-                        info!("->>> {:?}", e);
+                        error!("handle_connection failed: {:?}", e);
                     }
                 });
             }
