@@ -162,7 +162,8 @@ impl ReceiveAPI for Connection {
 }
 
 pub struct Connection {
-    endpoint: Endpoint,    
+    endpoint: Option<Endpoint>,  
+    conn: Option<quinn::Connection>,  
     mpsc_sender: Option<Sender>,
     inner_sender: Arc<Mutex<QuicFramedSend>>,
     inner_stream: QuicFramedRecv,
@@ -170,7 +171,7 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub async fn new_conn_wrapper(stream: (SendStream, RecvStream), endpoint: Endpoint, ms_timeout: u64) -> ResultType<Self> {
+    pub async fn new_conn_wrapper(stream: (SendStream, RecvStream), ms_timeout: u64) -> ResultType<Self> {
         let sink_sender = FramedWrite::new(stream.0, BytesCodec::new());
         let inner_stream = FramedRead::new(stream.1, BytesCodec::new());
         let frame_sender = Arc::new(Mutex::new(sink_sender));
@@ -203,7 +204,7 @@ impl Connection {
             }
             log::error!("Conn sender exit loop!!!");
         });
-        Ok(Connection { mpsc_sender: Some(conn_sender),inner_sender: frame_sender, inner_stream, endpoint, ms_timeout })
+        Ok(Connection { mpsc_sender: Some(conn_sender),inner_sender: frame_sender, inner_stream, endpoint: None, ms_timeout, conn: None })
     }
 
     pub async fn new_for_client_conn(
@@ -216,7 +217,9 @@ impl Connection {
         let stream = connection
         .open_bi()
         .await?;
-        let conn = Connection::new_conn_wrapper(stream, endpoint, ms_timeout).await?;
+        let mut conn = Connection::new_conn_wrapper(stream, ms_timeout).await?;
+        conn.conn = Some(connection);
+        conn.endpoint = Some(endpoint);
         Ok(conn)
     }
 
@@ -233,6 +236,14 @@ impl Connection {
     #[inline]
     pub async fn shutdown(&mut self) -> ResultType<()> {
         self.inner_sender.lock().await.close().await?;
+        
+        if let Some(conn) = &self.conn {
+            conn.close(0u32.into(), b"done");
+        }
+        // Give the peer a fair chance to receive the close packet
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.wait_idle().await;
+        }
         Ok(())
     }
 
