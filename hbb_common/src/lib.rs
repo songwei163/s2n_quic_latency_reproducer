@@ -3,7 +3,7 @@ pub mod platform;
 pub use bytes;
 pub use futures;
 pub use protobuf;
-pub use s2n_quic;
+pub use quinn;
 #[path = "./protos/message.rs"]
 pub mod message_proto;
 use std::{
@@ -35,7 +35,7 @@ pub use tokio_socks::IntoTargetAddr;
 pub use tokio_socks::TargetAddr;
 
 #[cfg(feature = "quic")]
-pub type Stream = quic::Connection;
+// pub type Stream = quic::Connection;
 #[cfg(not(feature = "quic"))]
 pub type Stream = tcp::FramedStream;
 

@@ -20,8 +20,9 @@ futures-util = "0.3"
 lazy_static = "1.4"
 log = "0.4"
 protobuf = {version = "3.1", features = ["with-bytes"]}
-quinn = {version = "0.8", optional = true}
+quinn = {version = "0.9.3", optional = true}
 rand = "0.8"
+rcgen = "0.10.0"
 regex = "1.6"
 rustls = {version = "0.20", default-features = false, features = ["quic"], optional = true}
 rustls-pemfile = "1"
@@ -42,7 +43,7 @@ machine-uid = "0.2"
 
 [features]
 default = ["quic", "rustls_dangerous_configuration"]
-quic = ["s2n-quic"]
+quic = ["quinn"]
 rustls_dangerous_configuration = ["rustls/dangerous_configuration"]
 
 [build-dependencies]

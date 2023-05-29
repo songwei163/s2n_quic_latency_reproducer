@@ -1,79 +1,89 @@
-#![cfg(feature = "rustls")]
+use std::time::{self, Instant};
+use anyhow::{anyhow};
+use std::{net::SocketAddr, sync::Arc};
+use crate::ResultType;
+use quinn::{ClientConfig, Endpoint, VarInt};
 
-use crate::{anyhow::anyhow, bytes_codec::BytesCodec, ResultType};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use futures_util::{
+use protobuf::Message;
+use tokio_util::codec::{FramedRead, FramedWrite};
+use quinn::{SendStream, RecvStream};
+use std::{
+    io::{BufReader, Error},
+};
+use crate::bytes_codec::BytesCodec;
+
+use tokio::{
+    self,
+    sync::{mpsc, Mutex},
+};
+
+type Sender = mpsc::Sender<Bytes>;
+pub type QuicFramedSend = FramedWrite<SendStream, BytesCodec>;
+pub type QuicFramedRecv = FramedRead<RecvStream, BytesCodec>;
+use futures::{
     sink::SinkExt,
     stream::{SplitSink, SplitStream, StreamExt},
 };
-use protobuf::Message;
-use rustls;
-use s2n_quic::{
-    client::Connect, provider::io::tokio::Builder as IoBuilder, stream::BidirectionalStream,
-    Client, Server,
-};
-use std::{
-    fs::File,
-    io::{BufReader, Error},
-    net::SocketAddr,
-    ops::{Deref, DerefMut},
-    path::Path,
-    str,
-    sync::Arc,
-    time::Duration,
-};
-use tokio::{
-    self,
-    sync::{mpsc, RwLock},
-};
-use tokio_util::codec::Framed;
-
-pub const SERVER_NAME: &str = "localhost";
-// const ACK_LATENCY: u64 = 0;
-// const MAX_HANDSHAKE_DURATION: u64 = 3;
-// const MAX_ACK_RANGES: u8 = 100;
-// const CONN_TIMEOUT: u64 = 5;
-// const KEEP_ALIVE_PERIOD: u64 = 2;
-
-struct Cert<'a> {
-    cert_pom: &'a str,
-    key_pom: &'a str,
-}
-
-lazy_static::lazy_static! {
-    static ref CERT: Cert<'static> = Cert {
-        cert_pom: "libs/hbb_common/cert/cert.pem",
-        key_pom: "libs/hbb_common/cert/key.pem"
-    };
-}
 
 const MAX_BUFFER_SIZE: usize = 128;
-type Sender = mpsc::Sender<Bytes>;
-pub type QuicFramedSink = SplitSink<Framed<BidirectionalStream, BytesCodec>, Bytes>;
-pub type QuicFramedStream = SplitStream<Framed<BidirectionalStream, BytesCodec>>;
 
-pub struct FramedQuic(Framed<BidirectionalStream, BytesCodec>);
+/// Enables MTUD if supported by the operating system
+#[cfg(not(any(windows, os = "linux")))]
+pub fn enable_mtud_if_supported() -> quinn::TransportConfig {
+    let transport_config = quinn::TransportConfig::default();
+    transport_config
+}
 
-impl Deref for FramedQuic {
-    type Target = Framed<BidirectionalStream, BytesCodec>;
+struct SkipServerVerification;
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl SkipServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self)
     }
 }
 
-impl DerefMut for FramedQuic {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+impl rustls::client::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
     }
 }
 
-pub struct Connection {
-    client: Option<Client>,
-    mpsc_sender: Option<Sender>,
-    inner_sender: Arc<RwLock<QuicFramedSink>>,
-    inner_stream: QuicFramedStream,
+fn configure_client() -> ResultType<ClientConfig> {
+    let crypto = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_custom_certificate_verifier(SkipServerVerification::new())
+        .with_no_client_auth();
+
+    let mut client_config = ClientConfig::new(Arc::new(crypto));
+    let mut transport_config = enable_mtud_if_supported();
+    transport_config.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
+    client_config.transport_config(Arc::new(transport_config));
+
+    Ok(client_config)
+}
+
+/// Constructs a QUIC endpoint configured for use a client only.
+///
+/// ## Args
+///
+/// - server_certs: list of trusted certificates.
+#[allow(unused)]
+pub fn make_client_endpoint(bind_addr: SocketAddr) -> ResultType<Endpoint> {
+    let client_cfg = configure_client()?;
+    let mut endpoint = Endpoint::client(bind_addr)?;
+    endpoint.set_default_client_config(client_cfg);
+    Ok(endpoint)
 }
 
 #[async_trait]
@@ -90,21 +100,6 @@ pub trait SendAPI {
     }
 
     async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()>;
-}
-
-#[async_trait]
-pub trait ReceiveAPI {
-    async fn next(&mut self) -> Option<Result<BytesMut, Error>>;
-
-    #[inline]
-    async fn next_timeout(&mut self, ms: u64) -> Option<Result<BytesMut, Error>> {
-        if let Ok(res) =
-            tokio::time::timeout(std::time::Duration::from_millis(ms), self.next()).await
-        {
-            return res;
-        }
-        None
-    }
 }
 
 #[derive(Clone)]
@@ -124,9 +119,34 @@ impl SendAPI for ConnSender {
     }
 }
 
-impl ConnSender {
-    pub fn new(sender: Sender) -> Self {
-        ConnSender { sender }
+#[async_trait]
+impl SendAPI for Connection {
+    #[inline]
+    async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
+        let mut lock = self.inner_sender.lock().await;
+        if self.ms_timeout > 0 {
+            super::timeout(self.ms_timeout, lock.send(bytes)).await??;
+        } else {
+            lock.send(bytes)
+                .await
+                .map(|e| anyhow!("failed to send data: {:?}", e))?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+pub trait ReceiveAPI {
+    async fn next(&mut self) -> Option<Result<BytesMut, Error>>;
+
+    #[inline]
+    async fn next_timeout(&mut self, ms: u64) -> Option<Result<BytesMut, Error>> {
+        if let Ok(res) =
+            tokio::time::timeout(std::time::Duration::from_millis(ms), self.next()).await
+        {
+            return res;
+        }
+        None
     }
 }
 
@@ -139,145 +159,63 @@ impl ReceiveAPI for Connection {
     }
 }
 
-#[async_trait]
-impl SendAPI for Connection {
-    #[inline]
-    async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
-        let mut lock = self.inner_sender.write().await;
-        lock.send(bytes)
-            .await
-            .map_err(|e| anyhow!("failed to send data: {}", e))?;
-        // lock.flush().await?;
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-pub struct Limits {
-    /// The maximum Mbits/sec for each connection
-    pub max_throughput: u64,
-
-    /// The expected RTT in milliseconds
-    pub expected_rtt: u64,
-}
-
-impl Limits {
-    pub fn new() -> Self {
-        // 50 Mbits/s and RTT 200 ms
-        Limits {
-            max_throughput: 50,
-            expected_rtt: 200,
-        }
-    }
-
-    pub fn limits(&self) -> s2n_quic::provider::limits::Limits {
-        let data_window = self.data_window();
-
-        s2n_quic::provider::limits::Limits::default()
-            .with_data_window(data_window)
-            .unwrap()
-            .with_max_handshake_duration(core::time::Duration::from_millis(self.expected_rtt))
-            .unwrap()
-            .with_max_send_buffer_size(data_window.min(u32::MAX as _) as _)
-            .unwrap()
-            .with_bidirectional_local_data_window(data_window)
-            .unwrap()
-            .with_bidirectional_remote_data_window(data_window)
-            .unwrap()
-            .with_unidirectional_data_window(data_window)
-            .unwrap()
-            .with_max_open_local_bidirectional_streams(data_window)
-            .unwrap()
-            .with_max_open_remote_bidirectional_streams(data_window)
-            .unwrap()
-            .with_max_ack_delay(core::time::Duration::from_millis(self.expected_rtt))
-            .unwrap()
-            .with_max_keep_alive_period(core::time::Duration::from_millis(self.expected_rtt))
-            .unwrap()
-    }
-
-    const fn compute_data_window(&self, mbps: u64, rtt: Duration, rtt_count: u64) -> u64 {
-        // ideal throughput in Mbps
-        let mut window = mbps;
-        // Mbit/sec * 125 -> bytes/ms
-        window *= 125;
-        // bytes/ms * ms/RTT -> bytes/RTT
-        window *= rtt.as_millis() as u64;
-        // bytes/RTT * rtt_count -> N * bytes/RTT
-        window *= rtt_count;
-
-        window as u64
-    }
-
-    fn data_window(&self) -> u64 {
-        self.compute_data_window(
-            self.max_throughput,
-            core::time::Duration::from_millis(self.expected_rtt),
-            2,
-        )
-    }
+pub struct Connection {
+    endpoint: Endpoint,    
+    mpsc_sender: Option<Sender>,
+    inner_sender: Arc<Mutex<QuicFramedSend>>,
+    inner_stream: QuicFramedRecv,
+    ms_timeout: u64,
 }
 
 impl Connection {
-    pub async fn new_conn_wrapper(stream: BidirectionalStream) -> ResultType<Self> {
-        let frame_wrapper = Framed::new(stream, BytesCodec::new());
-        let (sink_sender, inner_stream) = frame_wrapper.split();
-        let frame_sender = Arc::new(RwLock::new(sink_sender));
+    pub async fn new_conn_wrapper(stream: (SendStream, RecvStream), endpoint: Endpoint, ms_timeout: u64) -> ResultType<Self> {
+        let sink_sender = FramedWrite::new(stream.0, BytesCodec::new());
+        let inner_stream = FramedRead::new(stream.1, BytesCodec::new());
+        let frame_sender = Arc::new(Mutex::new(sink_sender));
         let (conn_sender, mut conn_receiver) = mpsc::channel::<Bytes>(MAX_BUFFER_SIZE);
         let sender_ref = frame_sender.clone();
         tokio::spawn(async move {
             loop {
                 match conn_receiver.recv().await {
                     Some(data) => {
-                        sender_ref
-                            .write()
-                            .await
-                            .send(data)
-                            .await
-                            .map_err(|e| anyhow!("failed to send data by sender channel: {}", e))
-                            .ok();
+                        let mut lock = sender_ref.lock().await;
+                        if ms_timeout > 0 {
+                            if let Err(e) =
+                                super::timeout(ms_timeout, lock.send(data)).await
+                            {
+                                log::info!(
+                                    "quic send failed from send channel timeout: {}",
+                                    e
+                                );
+                                break;
+                            }
+                        } else {
+                            if let Err(e) = lock.send(data).await {
+                                log::info!("quic send failed from send channel: {}", e);
+                                break;
+                            }
+                        }
                     }
                     None => break,
                 }
             }
             log::error!("Conn sender exit loop!!!");
         });
-
-        Ok(Connection {
-            client: None,
-            mpsc_sender: Some(conn_sender),
-            inner_sender: frame_sender,
-            inner_stream,
-        })
+        Ok(Connection { mpsc_sender: Some(conn_sender),inner_sender: frame_sender, inner_stream, endpoint, ms_timeout })
     }
 
     pub async fn new_for_client_conn(
         server_addr: SocketAddr,
         local_addr: SocketAddr,
+        ms_timeout: u64,
     ) -> ResultType<Self> {
-        let io = IoBuilder::default()
-            .with_receive_address(local_addr)?
-            .build()?;
-
-        let client = Client::builder()
-            .with_tls(Path::new(CERT.cert_pom))?
-            .with_limits(Limits::new().limits())?
-            .with_io(io)?
-            .start()
-            .unwrap();
-
-        let connect = Connect::new(server_addr).with_server_name("localhost");
-        let mut connection = client.connect(connect).await?;
-        connection.keep_alive(true)?;
-
-        let stream = connection.open_bidirectional_stream().await?;
-        let mut conn = Connection::new_conn_wrapper(stream).await?;
-        conn.set_client(client);
+        let endpoint = make_client_endpoint(local_addr)?;
+        let connection = super::timeout(ms_timeout, endpoint.connect(server_addr, "localhost")?).await??;
+        let stream = connection
+        .open_bi()
+        .await?;
+        let conn = Connection::new_conn_wrapper(stream, endpoint, ms_timeout).await?;
         Ok(conn)
-    }
-
-    fn set_client(&mut self, client: Client) {
-        self.client = Some(client);
     }
 
     pub async fn get_conn_sender(&self) -> ResultType<ConnSender> {
@@ -291,72 +229,45 @@ impl Connection {
     }
 
     #[inline]
-    pub fn local_address(&self) -> ResultType<SocketAddr> {
-        if self.client.is_none() {
-            return Err(anyhow!("Not init the client."));
-        }
-
-        match self.client.as_ref().unwrap().local_addr() {
-            Ok(addr) => {
-                return Ok(addr);
-            }
-            Err(e) => {
-                return Err(anyhow!("Get local addr failed {}", e));
-            }
-        };
+    pub async fn shutdown(&mut self) -> ResultType<()> {
+        self.inner_sender.lock().await.close().await?;
+        Ok(())
     }
 
     #[inline]
-    pub async fn shutdown(&mut self) -> ResultType<()> {
-        self.inner_sender.write().await.close().await?;
-        Ok(())
+    pub async fn next(&mut self) -> Option<Result<BytesMut, Error>> {
+        let res = self.inner_stream.next().await;
+        res
     }
 }
 
 pub mod server {
     use super::*;
+    use quinn::{Endpoint, ServerConfig, VarInt};
+    /// Returns default server configuration along with its certificate.
+    fn configure_server() -> ResultType<(ServerConfig, Vec<u8>)> {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = cert.serialize_der().unwrap();
+        let priv_key = cert.serialize_private_key_der();
+        let priv_key = rustls::PrivateKey(priv_key);
+        let cert_chain = vec![rustls::Certificate(cert_der.clone())];
 
-    pub fn new_server(bind_addr: SocketAddr) -> ResultType<Server> {
-        let io = IoBuilder::default()
-            .with_receive_address(bind_addr)?
-            .build()?;
+        let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key)?;
+        let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
+        transport_config.max_concurrent_uni_streams(0_u8.into());
+        transport_config.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
+        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
+        #[cfg(any(windows, os = "linux"))]
+        transport_config.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
 
-        let server = Server::builder()
-            .with_tls((Path::new(CERT.cert_pom), Path::new(CERT.key_pom)))?
-            .with_limits(Limits::new().limits())?
-            .with_io(io)?
-            .start()
-            .unwrap();
-        Ok(server)
-    }
-}
-
-pub fn load_certs(filename: &str) -> Vec<rustls::Certificate> {
-    let certfile =
-        File::open(filename).expect(&format!("cannot open certificate file: {:?}", filename));
-    let mut reader = BufReader::new(certfile);
-    rustls_pemfile::certs(&mut reader)
-        .unwrap()
-        .iter()
-        .map(|v| rustls::Certificate(v.clone()))
-        .collect()
-}
-
-pub fn load_private_key(filename: &str) -> rustls::PrivateKey {
-    let keyfile = File::open(filename).expect("cannot open private key file");
-    let mut reader = BufReader::new(keyfile);
-
-    loop {
-        match rustls_pemfile::read_one(&mut reader).expect("cannot parse private key .pem file") {
-            Some(rustls_pemfile::Item::RSAKey(key)) => return rustls::PrivateKey(key),
-            Some(rustls_pemfile::Item::PKCS8Key(key)) => return rustls::PrivateKey(key),
-            None => break,
-            _ => {}
-        }
+        Ok((server_config, cert_der))
     }
 
-    panic!(
-        "no keys found in {:?} (encrypted keys not supported)",
-        filename
-    );
+    #[allow(unused)]
+    pub fn make_server_endpoint(bind_addr: SocketAddr) -> ResultType<(Endpoint, Vec<u8>)> {
+        let (server_config, server_cert) = configure_server()?;
+        let endpoint = Endpoint::server(server_config, bind_addr)?;
+        Ok((endpoint, server_cert))
+    }
+
 }
