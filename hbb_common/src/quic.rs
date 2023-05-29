@@ -3,7 +3,6 @@ use anyhow::{anyhow};
 use std::{net::SocketAddr, sync::Arc};
 use crate::ResultType;
 use quinn::{ClientConfig, Endpoint, VarInt};
-
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use protobuf::Message;
@@ -29,61 +28,64 @@ use futures::{
 
 const MAX_BUFFER_SIZE: usize = 128;
 
-/// Enables MTUD if supported by the operating system
-#[cfg(not(any(windows, os = "linux")))]
-pub fn enable_mtud_if_supported() -> quinn::TransportConfig {
-    let transport_config = quinn::TransportConfig::default();
-    transport_config
-}
-
-struct SkipServerVerification;
-
-impl SkipServerVerification {
-    fn new() -> Arc<Self> {
-        Arc::new(Self)
+pub mod client {
+    use super::*;
+    /// Enables MTUD if supported by the operating system
+    #[cfg(not(any(windows, os = "linux")))]
+    pub fn enable_mtud_if_supported() -> quinn::TransportConfig {
+        let transport_config = quinn::TransportConfig::default();
+        transport_config
     }
-}
 
-impl rustls::client::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
+    struct SkipServerVerification;
+
+    impl SkipServerVerification {
+        fn new() -> Arc<Self> {
+            Arc::new(Self)
+        }
     }
-}
 
-fn configure_client() -> ResultType<ClientConfig> {
-    let crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_custom_certificate_verifier(SkipServerVerification::new())
-        .with_no_client_auth();
+    impl rustls::client::ServerCertVerifier for SkipServerVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::Certificate,
+            _intermediates: &[rustls::Certificate],
+            _server_name: &rustls::ServerName,
+            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _ocsp_response: &[u8],
+            _now: std::time::SystemTime,
+        ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::ServerCertVerified::assertion())
+        }
+    }
 
-    let mut client_config = ClientConfig::new(Arc::new(crypto));
-    let mut transport_config = enable_mtud_if_supported();
-    transport_config.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
-    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
-    client_config.transport_config(Arc::new(transport_config));
+    fn configure_client() -> ResultType<ClientConfig> {
+        let crypto = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_custom_certificate_verifier(SkipServerVerification::new())
+            .with_no_client_auth();
 
-    Ok(client_config)
-}
+        let mut client_config = ClientConfig::new(Arc::new(crypto));
+        let mut transport_config = enable_mtud_if_supported();
+        transport_config.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
+        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
+        client_config.transport_config(Arc::new(transport_config));
 
-/// Constructs a QUIC endpoint configured for use a client only.
-///
-/// ## Args
-///
-/// - server_certs: list of trusted certificates.
-#[allow(unused)]
-pub fn make_client_endpoint(bind_addr: SocketAddr) -> ResultType<Endpoint> {
-    let client_cfg = configure_client()?;
-    let mut endpoint = Endpoint::client(bind_addr)?;
-    endpoint.set_default_client_config(client_cfg);
-    Ok(endpoint)
+        Ok(client_config)
+    }
+
+    /// Constructs a QUIC endpoint configured for use a client only.
+    ///
+    /// ## Args
+    ///
+    /// - server_certs: list of trusted certificates.
+    #[allow(unused)]
+    pub fn make_client_endpoint(bind_addr: SocketAddr) -> ResultType<Endpoint> {
+        let client_cfg = configure_client()?;
+        let mut endpoint = Endpoint::client(bind_addr)?;
+        endpoint.set_default_client_config(client_cfg);
+        Ok(endpoint)
+    }
 }
 
 #[async_trait]
@@ -209,7 +211,7 @@ impl Connection {
         local_addr: SocketAddr,
         ms_timeout: u64,
     ) -> ResultType<Self> {
-        let endpoint = make_client_endpoint(local_addr)?;
+        let endpoint = client::make_client_endpoint(local_addr)?;
         let connection = super::timeout(ms_timeout, endpoint.connect(server_addr, "localhost")?).await??;
         let stream = connection
         .open_bi()
