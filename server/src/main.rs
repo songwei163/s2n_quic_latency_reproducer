@@ -1,7 +1,7 @@
 use hbb_common::{
     message_proto::{message, Message as FrameMessage},
     protobuf::Message,
-    quic::{server, ReceiveAPI, SendAPI},
+    quic::{server, ReceiveAPI, SendAPI, Connection},
     ResultType, anyhow::anyhow,
     bytes_codec::BytesCodec
 };
@@ -54,13 +54,12 @@ async fn handle_connection(conn: quinn::Connecting) -> ResultType<()> {
 }
 
 async fn handle_request(
-    (send, recv): (quinn::SendStream, quinn::RecvStream),
+    stream: (quinn::SendStream, quinn::RecvStream),
 ) -> ResultType<()> {
-    let mut framed_recv = FramedRead::new(recv, BytesCodec::new());
-    let mut framed_send = FramedWrite::new(send, BytesCodec::new()); 
+    let mut conn = Connection::new_conn_wrapper(stream, 5000).await?;
     loop {
         tokio::select! {
-            res = framed_recv.next() => {
+            res = conn.next() => {
                 if let Some(res) = res {
                     match res {
                         Ok(bytes) => {
@@ -71,7 +70,7 @@ async fn handle_request(
                                             if vf.timestamp > 0 {
                                                 let data = bytes.freeze();
                                                 info!("forward the bytes received, timestamp: {:?}, size: {:?}", time::Instant::now(), data.len());
-                                                framed_send.send(data).await.ok();
+                                                conn.send_bytes(data).await.ok();
                                             }
                                         }
                                         _ => {

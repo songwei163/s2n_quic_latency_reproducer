@@ -247,11 +247,6 @@ impl Connection {
         Ok(())
     }
 
-    #[inline]
-    pub async fn next(&mut self) -> Option<Result<BytesMut, Error>> {
-        let res = self.inner_stream.next().await;
-        res
-    }
 }
 
 pub mod server {
